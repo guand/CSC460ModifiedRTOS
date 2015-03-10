@@ -381,9 +381,7 @@ static void kernel_handle_request(void)
     "pop    r29             \n\t"\
     "pop    r30             \n\t"\
     "pop    r31             \n\t"\
-    "out    __SREG__, r31   \n\t"\
-    "pop    r31             \n\t"\
-    "out    0X3C, r31       \n\t"\
+	"out    __SREG__, r31    \n\t"\
     "pop    r31             \n\t"::);
 
 
