@@ -300,8 +300,6 @@ static void kernel_handle_request(void)
  */
 #define    SAVE_CTX_TOP()       asm volatile (\
     "push   r31             \n\t"\
-    "in     r31,0X3C        \n\t"\
-    "push   r31             \n\t"\
     "in     r31,__SREG__    \n\t"\
     "cli                    \n\t"::); /* Disable interrupt */
 
@@ -383,9 +381,7 @@ static void kernel_handle_request(void)
     "pop    r29             \n\t"\
     "pop    r30             \n\t"\
     "pop    r31             \n\t"\
-    "out    __SREG__, r31   \n\t"\
-    "pop    r31             \n\t"\
-    "out    0X3C, r31       \n\t"\
+	"out    __SREG__, r31    \n\t"\
     "pop    r31             \n\t"::);
 
 
