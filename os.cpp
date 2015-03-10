@@ -9,6 +9,8 @@
  * @author Justin Tanner
  */
 
+#define F_CPU 16000000UL
+
 #include <avr/io.h>
 #include <avr/interrupt.h>
 #include <util/delay.h>
@@ -16,22 +18,18 @@
 #include "os.h"
 #include "kernel.h"
 #include "error_code.h"
-#include "main.h"
-#include "trace/trace.h"
 
 /* Needed for memset */
 /* #include <string.h> */
 
-/* Maintains the number of ms passes since OS_Init() */
-static uint16_t ms_counter = 0;
-
-#define STACKCONTEXTSIZE (32 + 1 + 1 + 3 + 3)
-
 /** @brief main function provided by user application. The first task to run. */
 extern int r_main();
 
-/** Decides whether publishing to a service will return to publisher or can be preempted by a subscriber */
-static volatile bool tasks_preemptable = true;
+/** PPP and PT defined in user application. */
+extern const unsigned char PPP[];
+
+/** PPP and PT defined in user application. */
+extern const unsigned int PT;
 
 /** The task descriptor of the currently RUNNING task. */
 static task_descriptor_t* cur_task = NULL;
@@ -54,18 +52,6 @@ static volatile create_args_t kernel_request_create_args;
 /** Return value for Task_Create() request. */
 static volatile int kernel_request_retval;
 
-/** Argument and return value for Service class of requests. */
-static volatile SERVICE* kernel_request_service_ptr;
-
-/** Data to publish to waiting subscribed tasks. */
-static volatile int16_t kernel_request_service_data;
-
-/** Number of services created so far */
-static uint8_t num_services_created = 0;
-
-/** An array of queues for tasks waiting on services. */
-static queue_t service_queue[MAXSERVICE];
-
 /** Number of tasks created so far */
 static queue_t dead_pool_queue;
 
@@ -75,8 +61,20 @@ static queue_t rr_queue;
 /** The ready queue for SYSTEM tasks. Their scheduling is first come, first served. */
 static queue_t system_queue;
 
-/** The ready queue for PERIODIC tasks. Their scheduling is next earliest task to run. */
-static queue_t periodic_queue;
+/** time remaining in current slot */
+static volatile uint8_t ticks_remaining = 0;
+
+/** Indicates if periodic task in this slot has already run this time */
+static uint8_t slot_task_finished = 0;
+
+/** Index of name of task in current slot in PPP array. An even number from 0 to 2*(PT-1). */
+static unsigned int slot_name_index = 0;
+
+/** The task descriptor for index "name of task" */
+static task_descriptor_t* name_to_task_ptr[MAXNAME + 1];
+
+/** The names that appear in PPP */
+static uint8_t name_in_PPP[MAXNAME + 1];
 
 /** Error message used in OS_Abort() */
 static uint8_t volatile error_msg = ERR_RUN_1_USER_CALLED_OS_ABORT;
@@ -94,21 +92,19 @@ extern "C" void TIMER1_COMPA_vect(void) __attribute__ ((signal, naked));
 
 static int kernel_create_task();
 static void kernel_terminate_task(void);
-static void kernel_service_subscribe(void);
-static void kernel_service_publish(void);
-static uint8_t get_service_handle(void);
 /* queues */
 
 static void enqueue(queue_t* queue_ptr, task_descriptor_t* task_to_add);
-static void enqueue_periodic(task_descriptor_t* task_to_add);
 static task_descriptor_t* dequeue(queue_t* queue_ptr);
 
 static void kernel_update_ticker(void);
+static void check_PPP_names(void);
 static void idle (void);
 static void _delay_25ms(void);
 
-/* FUNCTIONS */
-
+/*
+ * FUNCTIONS
+ */
 /**
  *  @brief The idle task does nothing but busy loop.
  */
@@ -121,6 +117,7 @@ static void idle (void)
 
 /**
  * @fn kernel_main_loop
+ *
  * @brief The heart of the RTOS, the main loop where the kernel is entered and exited.
  *
  * The complete function is:
@@ -150,7 +147,8 @@ static void kernel_main_loop(void)
 
 /**
  * @fn kernel_dispatch
- * @brief The second part of the scheduler.
+ *
+ *@brief The second part of the scheduler.
  *
  * Chooses the next task to run.
  *
@@ -161,25 +159,16 @@ static void kernel_dispatch(void)
      * kernel_handle_request() has already determined it should be selected.
      */
 
-    if((cur_task->state != RUNNING || cur_task == idle_task) && tasks_preemptable)
+    if(cur_task->state != RUNNING || cur_task == idle_task)
     {
-        uint16_t now = Now();
-        if(system_queue.head != NULL)
+		if(system_queue.head != NULL)
         {
             cur_task = dequeue(&system_queue);
         }
-        else if (periodic_queue.head != NULL && ((now - periodic_queue.head->last) >= (periodic_queue.head->offset + periodic_queue.head->period)))
+        else if(!slot_task_finished && PT > 0 && name_to_task_ptr[PPP[slot_name_index]] != NULL)
         {
             /* Keep running the current PERIODIC task. */
-            cur_task = dequeue(&periodic_queue);
-            
-            cur_task->last += cur_task->period + cur_task->offset;
-            cur_task->ticks_running_no_preemp = now;
-            
-            if (periodic_queue.head != NULL && ((now - periodic_queue.head->last) >= (periodic_queue.head->offset + periodic_queue.head->period))) {
-                error_msg = ERR_RUN_6_INVALID_PERIODIC_SCHEDULING;
-                OS_Abort();
-            }
+            cur_task = name_to_task_ptr[PPP[slot_name_index]];
         }
         else if(rr_queue.head != NULL)
         {
@@ -198,10 +187,11 @@ static void kernel_dispatch(void)
 
 /**
  * @fn kernel_handle_request
- * @brief The first part of the scheduler.
+ *
+ *@brief The first part of the scheduler.
  *
  * Perform some action based on the system call or timer tick.
- * Perhaps place the current process in a ready or waiting queue.
+ * Perhaps place the current process in a ready or waitng queue.
  */
 static void kernel_handle_request(void)
 {
@@ -225,7 +215,7 @@ static void kernel_handle_request(void)
     case TASK_CREATE:
         kernel_request_retval = kernel_create_task();
 
-        /* Check if new task has higher priority, and that it wasn't an ISR
+        /* Check if new task has higer priority, and that it wasn't an ISR
          * making the request.
          */
         if(kernel_request_retval)
@@ -234,16 +224,12 @@ static void kernel_handle_request(void)
             if(kernel_request_create_args.level == SYSTEM && cur_task->level != SYSTEM)
             {
                 cur_task->state = READY;
-                if(cur_task->level == PERIODIC) {
-                    cur_task->ticks_running_previous += Now() - cur_task->ticks_running_no_preemp;
-                    cur_task->last -= cur_task->period;
-                    enqueue_periodic(cur_task);
-                } 
             }
 
             /* If cur is RR, it might be pre-empted by a new PERIODIC. */
             if(cur_task->level == RR &&
-               kernel_request_create_args.level == PERIODIC)
+               kernel_request_create_args.level == PERIODIC &&
+               PPP[slot_name_index] == kernel_request_create_args.name)
             {
                 cur_task->state = READY;
             }
@@ -257,87 +243,41 @@ static void kernel_handle_request(void)
         break;
 
     case TASK_TERMINATE:
-        if(cur_task != idle_task)
-        {
-            kernel_terminate_task();
-        }
+		if(cur_task != idle_task)
+		{
+        	kernel_terminate_task();
+		}
         break;
 
     case TASK_NEXT:
-        switch(cur_task->level)
-        {
-        case SYSTEM:
-            enqueue(&system_queue, cur_task);
-            break;
+		switch(cur_task->level)
+		{
+	    case SYSTEM:
+	        enqueue(&system_queue, cur_task);
+			break;
 
-        case PERIODIC:
-            if(((Now() - cur_task->ticks_running_no_preemp) + cur_task->ticks_running_previous) > cur_task->wcet)
-            {
-                /* error handling */
-                error_msg = ERR_RUN_3_PERIODIC_TOOK_TOO_LONG;
-                OS_Abort();
-            } else {
-                cur_task->ticks_running_previous = (uint16_t) 0;
-            }
-        
-            if (!cur_task->ran_once)
-            {
-                cur_task->ran_once = true;
-                cur_task->offset = (uint16_t) 0;
-            }
-            
-            enqueue_periodic(cur_task);
-            break;
+	    case PERIODIC:
+	        slot_task_finished = 1;
+	        break;
 
-        case RR:
-            enqueue(&rr_queue, cur_task);
-            break;
+	    case RR:
+	        enqueue(&rr_queue, cur_task);
+	        break;
 
-        default: /* idle_task */
-            break;
-        }
+	    default: /* idle_task */
+			break;
+		}
 
-        cur_task->state = READY;
+		cur_task->state = READY;
         break;
 
     case TASK_GET_ARG:
         /* Should not happen. Handled in task itself. */
         break;
-        
-    case SERVICE_INIT:
-        kernel_request_service_ptr = NULL;
-        if(num_services_created < MAXSERVICE)
-        {
-            /* Pass a number back to the task, but pretend it is a pointer.
-            * It is the index of the service_queue plus 1.
-            * (0 is return value for failure.) */
-            kernel_request_service_ptr = (SERVICE *)(uint16_t)(num_services_created + 1);
-
-            ++num_services_created;
-        } else {
-            kernel_request_service_ptr = (SERVICE *)(uint16_t) 0;
-        }
-        break;
-        
-    case SERVICE_SUBSCRIBE:
-        /* periodic tasks cannot subscribe. */
-        if(cur_task->level != PERIODIC)
-        {
-            kernel_service_subscribe();
-        } else {
-            /* error handling */
-            error_msg = ERR_RUN_7_ILLEGAL_PERIODIC_TASK_SUBSCRIBED_TO_SERVICE;
-            OS_Abort();
-        }
-        break;
-        
-    case SERVICE_PUBLISH:
-        kernel_service_publish();
-        break;
-        
+		
     default:
         /* Should never happen */
-        error_msg = ERR_RUN_5_RTOS_INTERNAL_ERROR;
+        error_msg = ERR_RUN_8_RTOS_INTERNAL_ERROR;
         OS_Abort();
         break;
     }
@@ -346,8 +286,9 @@ static void kernel_handle_request(void)
 }
 
 
-/* Context switching */
-
+/*
+ * Context switching
+ */
 /**
  * It is important to keep the order of context saving and restoring exactly
  * in reverse. Also, when a new task is created, it is important to
@@ -358,8 +299,6 @@ static void kernel_handle_request(void)
  * is used, the interrupts need to be disabled, or they already are disabled.
  */
 #define    SAVE_CTX_TOP()       asm volatile (\
-    "push   r31             \n\t"\
-    "in     r31,0X3C        \n\t"\
     "push   r31             \n\t"\
     "in     r31,__SREG__    \n\t"\
     "cli                    \n\t"::); /* Disable interrupt */
@@ -410,7 +349,6 @@ static void kernel_handle_request(void)
  * @brief Pop all registers and the status register.
  */
 #define    RESTORE_CTX()    asm volatile (\
-#define    RESTORE_CTX()    asm volatile (\
     "pop    r0                \n\t"\
     "pop    r1                \n\t"\
     "pop    r2                \n\t"\
@@ -443,15 +381,13 @@ static void kernel_handle_request(void)
     "pop    r29             \n\t"\
     "pop    r30             \n\t"\
     "pop    r31             \n\t"\
-    "out    __SREG__, r31   \n\t"\
-    "pop    r31             \n\t"\
-    "out    0X3C, r31       \n\t"\
+	"out    __SREG__, r31    \n\t"\
     "pop    r31             \n\t"::);
-
 
 
 /**
  * @fn exit_kernel
+ *
  * @brief The actual context switching code begins here.
  *
  * This function is called by the kernel. Upon entry, we are using
@@ -502,6 +438,7 @@ static void exit_kernel(void)
 
 /**
  * @fn enter_kernel
+ *
  * @brief All system calls eventually enter here.
  *
  * Assumption: We are still executing on cur_task's stack.
@@ -543,6 +480,7 @@ static void enter_kernel(void)
 
 /**
  * @fn TIMER1_COMPA_vect
+ *
  * @brief The interrupt handler for output compare interrupts on Timer 1
  *
  * Used to enter the kernel when a tick expires.
@@ -556,7 +494,7 @@ static void enter_kernel(void)
  */
 void TIMER1_COMPA_vect(void)
 {
-    //PORTB ^= _BV(PB7);        // Arduino LED
+	//PORTB ^= _BV(PB7);		// Arduino LED
     /*
      * Save the interrupted task's context on its stack,
      * and save the stack pointer.
@@ -588,8 +526,6 @@ void TIMER1_COMPA_vect(void)
      */
     kernel_request = TIMER_EXPIRED;
 
-    ms_counter += TICK;
-
     /*
      * Prepare for next tick interrupt.
      */
@@ -617,8 +553,9 @@ void TIMER1_COMPA_vect(void)
 }
 
 
-/* Tasks Functions */
-
+/*
+ * Tasks Functions
+ */
 /**
  *  @brief Kernel function to create a new task.
  *
@@ -626,7 +563,6 @@ void TIMER1_COMPA_vect(void)
  * it has called "enter_kernel()"; so that when we switch to it later, we
  * can just restore its execution context on its stack.
  * @sa enter_kernel
- * @return 0 or 1
  */
 static int kernel_create_task()
 {
@@ -641,30 +577,53 @@ static int kernel_create_task()
         return 0;
     }
 
-    /* idling "task" goes in last descriptor. */
-    if(kernel_request_create_args.level == 0)//NULL)
+    if(kernel_request_create_args.level == PERIODIC &&
+        (kernel_request_create_args.name == IDLE ||
+         kernel_request_create_args.name > MAXNAME))
     {
-        p = &task_desc[MAXPROCESS];
+        /* PERIODIC name is out of range [1 .. MAXNAME] */
+        error_msg = ERR_2_CREATE_NAME_OUT_OF_RANGE;
+        OS_Abort();
     }
-    /* Find an unused descriptor. */
-    else
+
+    if(kernel_request_create_args.level == PERIODIC &&
+        name_in_PPP[kernel_request_create_args.name] == 0)
     {
-        p = dequeue(&dead_pool_queue);
+        error_msg = ERR_5_NAME_NOT_IN_PPP;
+        OS_Abort();
     }
+
+    if(kernel_request_create_args.level == PERIODIC &&
+    name_to_task_ptr[kernel_request_create_args.name] != NULL)
+    {
+        /* PERIODIC name already used */
+        error_msg = ERR_4_PERIODIC_NAME_IN_USE;
+        OS_Abort();
+    }
+
+	/* idling "task" goes in last descriptor. */
+	if(kernel_request_create_args.level == NULL)
+	{
+		p = &task_desc[MAXPROCESS];
+	}
+	/* Find an unused descriptor. */
+	else
+	{
+	    p = dequeue(&dead_pool_queue);
+	}
 
     stack_bottom = &(p->stack[MAXSTACK-1]);
 
     /* The stack grows down in memory, so the stack pointer is going to end up
-     * pointing to the location 32 + 1 + 1 + 3 + 3 = 40 bytes above the bottom, to make
+     * pointing to the location 32 + 1 + 2 + 2 = 37 bytes above the bottom, to make
      * room for (from bottom to top):
      *   the address of Task_Terminate() to destroy the task if it ever returns,
      *   the address of the start of the task to "return" to the first time it runs,
      *   register 31,
-     *   the stored SREG,
-     *   the stored EIND (for 2560), and
+     *   the stored SREG, and
      *   registers 30 to 0.
      */
-    uint8_t* stack_top = stack_bottom - STACKCONTEXTSIZE;
+    uint8_t* stack_top = stack_bottom - (32 + 1 + 2 + 2);
 
     /* Not necessary to clear the task descriptor. */
     /* memset(p,0,sizeof(task_descriptor_t)); */
@@ -673,9 +632,8 @@ static int kernel_create_task()
      * stack_top[1] is r0. */
     stack_top[2] = (uint8_t) 0; /* r1 is the "zero" register. */
     /* stack_top[31] is r30. */
-    stack_top[32] = 0xEE;
-    stack_top[33] = (uint8_t) _BV(SREG_I); /* set SREG_I bit in stored SREG. */
-    /* stack_top[34] is r31. */
+    stack_top[32] = (uint8_t) _BV(SREG_I); /* set SREG_I bit in stored SREG. */
+    /* stack_top[33] is r31. */
 
     /* We are placing the address (16-bit) of the functions
      * onto the stack in reverse byte order (least significant first, followed
@@ -683,12 +641,10 @@ static int kernel_create_task()
      * (ret and reti) pop addresses off in BIG ENDIAN (most sig. first, least sig.
      * second), even though the AT90 is LITTLE ENDIAN machine.
      */
-    stack_top[35] = (uint8_t)(0);
-    stack_top[36] = (uint8_t)((uint16_t)(kernel_request_create_args.f) >> 8);
-    stack_top[37] = (uint8_t)(uint16_t)(kernel_request_create_args.f);
-    stack_top[38] = (uint8_t)(0);
-    stack_top[39] = (uint8_t)((uint16_t)Task_Terminate >> 8);
-    stack_top[40] = (uint8_t)(uint16_t)Task_Terminate;
+    stack_top[34] = (uint8_t)((uint16_t)(kernel_request_create_args.f) >> 8);
+    stack_top[35] = (uint8_t)(uint16_t)(kernel_request_create_args.f);
+    stack_top[36] = (uint8_t)((uint16_t)Task_Terminate >> 8);
+    stack_top[37] = (uint8_t)(uint16_t)Task_Terminate;
 
     /*
      * Make stack pointer point to cell above stack (the top).
@@ -699,37 +655,31 @@ static int kernel_create_task()
     p->state = READY;
     p->arg = kernel_request_create_args.arg;
     p->level = kernel_request_create_args.level;
-    if (p->level == PERIODIC) 
-    {
-        p->offset = (kernel_request_create_args.start - kernel_request_create_args.period) * TICK;
-        p->period = kernel_request_create_args.period * TICK;
-        p->wcet = kernel_request_create_args.wcet * TICK;
-        p->ticks_running_previous = (uint16_t) 0;
-        p->ticks_running_no_preemp = (uint16_t) 0;
-        p->last = (uint16_t) 0;
-        p->ran_once = false;
-    }
-    switch(kernel_request_create_args.level)
-    {
-    case PERIODIC:
-        /* Put this newly created periodic task into the periodic_queue */
-        enqueue_periodic(p);
-        break;
+    p->name = kernel_request_create_args.name;
+
+	switch(kernel_request_create_args.level)
+	{
+	case PERIODIC:
+		/* Put this newly created PPP task into the PPP lookup array */
+        name_to_task_ptr[kernel_request_create_args.name] = p;
+		break;
 
     case SYSTEM:
-        /* Put SYSTEM and Round Robin tasks on a queue. */
+    	/* Put SYSTEM and Round Robin tasks on a queue. */
         enqueue(&system_queue, p);
-        break;
+		break;
 
     case RR:
-        /* Put SYSTEM and Round Robin tasks on a queue. */
+		/* Put SYSTEM and Round Robin tasks on a queue. */
         enqueue(&rr_queue, p);
-        break;
+		break;
 
-    default:
-        /* idle task does not go in a queue */
-        break;
-    }
+	default:
+		/* idle task does not go in a queue */
+		break;
+	}
+
+
     return 1;
 }
 
@@ -741,100 +691,20 @@ static void kernel_terminate_task(void)
 {
     /* deallocate all resources used by this task */
     cur_task->state = DEAD;
+    if(cur_task->level == PERIODIC)
+    {
+        name_to_task_ptr[cur_task->name] = NULL;
+    }
     enqueue(&dead_pool_queue, cur_task);
 }
 
-/**
- * @brief Kernel function to place current task in a service waiting queue.
+/*
+ * Queue manipulation.
  */
-static void kernel_service_subscribe(void)
-{
-    uint8_t handle = get_service_handle();
-    
-    /* Place this task in a queue. */
-    cur_task->state = WAITING;
-    enqueue(&service_queue[handle], cur_task);
-}
-
-/**
- * @brief Kernel function to send a signal to the task in the waiting queue.
- */
-static void kernel_service_publish(void)
-{
-    uint8_t handle = get_service_handle();
-    bool pre_empted = false;
-    /* Wake up waiting services and publish data */
-    while (service_queue[handle].head != NULL)
-    {
-        task_descriptor_t* task_ptr = dequeue(&service_queue[handle]);
-        
-        *(task_ptr->service_data) = kernel_request_service_data;
-        if (task_ptr->level == SYSTEM)
-        {
-            enqueue(&system_queue, task_ptr);
-            
-            if (cur_task->level != SYSTEM)
-            {
-                pre_empted = true;
-            }
-        // periodic task somehow managed to become subscribed to a service
-        } else if (task_ptr->level == PERIODIC) {
-            /* Error code. */
-            error_msg = ERR_RUN_8_SUBSCRIBED_TO_NON_EXISTING_SERVICE;
-            OS_Abort();
-        } else {
-            enqueue(&rr_queue, task_ptr);
-        }
-    }
-    
-    if (pre_empted && tasks_preemptable)
-    {
-        cur_task->state = READY;
-        
-        switch(cur_task->level)
-        {
-            case PERIODIC:
-                cur_task->ticks_running_previous += Now() - cur_task->ticks_running_no_preemp;
-                cur_task->last -= cur_task->period;
-                enqueue_periodic(cur_task);
-                break;
-                
-            case RR:
-                enqueue(&rr_queue, cur_task);
-                break;
-            
-            // should not happen
-            default:
-                error_msg = ERR_RUN_5_RTOS_INTERNAL_ERROR;
-                OS_Abort();
-                break;
-        }
-    }
-}
-
-/**
- * @brief Retrieves the index handle to the service array from the SERVICE pointer.
- * @return handle (uint8_t)
- */
-static uint8_t get_service_handle(void)
-{
-        /* Check the handle of the service to ensure that it is initialized. */
-        uint8_t handle = (uint8_t)((uint16_t)(kernel_request_service_ptr) - 1);
-
-        if(handle < 0 || handle >= num_services_created)
-        {
-            /* Error code. */
-            error_msg = ERR_RUN_8_SUBSCRIBED_TO_NON_EXISTING_SERVICE;
-            OS_Abort();
-        }
-        
-        return handle;
-}
-
-/* Queue manipulation. */
 
 /**
  * @brief Add a task the head of the queue
+ *
  * @param queue_ptr the queue to insert in
  * @param task_to_add the task descriptor to add
  */
@@ -856,47 +726,10 @@ static void enqueue(queue_t* queue_ptr, task_descriptor_t* task_to_add)
     }
 }
 
-/**
- * @brief Add a task the periodic queue sorted by tasks that will run soonest
- * @param task_to_add the task descriptor to add
- */
-static void enqueue_periodic(task_descriptor_t* task_to_add)
-{
-    task_to_add->next = NULL;
-    queue_t* queue_ptr = &periodic_queue;
-    
-    if(queue_ptr->head == NULL)
-    {
-        /* empty queue */
-        queue_ptr->head = task_to_add;
-        queue_ptr->tail = task_to_add;
-        return;
-    }
-    
-    if(task_to_add->level == PERIODIC) 
-    {
-        uint16_t now = Now();
-        task_descriptor_t* head_ptr = queue_ptr->head;
-        while(head_ptr != NULL)
-        {
-            if (((task_to_add->offset + task_to_add->period) - (now - task_to_add->last)) < ((head_ptr->offset + head_ptr->period) - (now - head_ptr->last)))
-            {
-                task_to_add->next = head_ptr->next;
-                head_ptr->next = task_to_add;
-                return;
-            }
-            
-            head_ptr = head_ptr->next;
-        }
-    }
-
-    /* put task at the back of the queue */
-    queue_ptr->tail->next = task_to_add;
-    queue_ptr->tail = task_to_add;
-}
 
 /**
  * @brief Pops head of queue and returns it.
+ *
  * @param queue_ptr the queue to pop
  * @return the popped task descriptor
  */
@@ -913,22 +746,71 @@ static task_descriptor_t* dequeue(queue_t* queue_ptr)
     return task_ptr;
 }
 
+
 /**
  * @brief Update the current time.
  *
- * Perhaps move to the next periodic task.
+ * Perhaps move to the next time slot of the PPP.
  */
 static void kernel_update_ticker(void)
 {
     /* PORTD ^= LED_D5_RED; */
-    
-    /* If Periodic task still running then error more than wcet */
-    if(cur_task != NULL && cur_task->level == PERIODIC && cur_task->state == RUNNING)
+
+    if(PT > 0)
     {
-        if(((Now() - cur_task->ticks_running_no_preemp) + cur_task->ticks_running_previous) > cur_task->wcet)
+        --ticks_remaining;
+
+        if(ticks_remaining == 0)
         {
-            /* error handling */
-            error_msg = ERR_RUN_3_PERIODIC_TOOK_TOO_LONG;
+            /* If Periodic task still running then error */
+            if(cur_task != NULL && cur_task->level == PERIODIC && slot_task_finished == 0)
+            {
+                /* error handling */
+                error_msg = ERR_RUN_3_PERIODIC_TOOK_TOO_LONG;
+                OS_Abort();
+            }
+
+            slot_name_index += 2;
+            if(slot_name_index >= 2 * PT)
+            {
+                slot_name_index = 0;
+            }
+
+            ticks_remaining = PPP[slot_name_index + 1];
+
+            if(PPP[slot_name_index] == IDLE || name_to_task_ptr[PPP[slot_name_index]] == NULL)
+            {
+                slot_task_finished = 1;
+            }
+            else
+            {
+                slot_task_finished = 0;
+            }
+        }
+    }
+}
+
+
+/**
+ * @brief Validate the PPP array.
+ */
+static void check_PPP_names(void)
+{
+    uint8_t i;
+    uint8_t name;
+
+    for(i = 0; i < 2 * PT; i += 2)
+    {
+        name = PPP[i];
+
+        /* name == IDLE or 0 < name <= MAXNAME */
+        if(name <= MAXNAME)
+        {
+            name_in_PPP[name] = 1;
+        }
+        else
+        {
+            error_msg = ERR_1_PPP_NAME_OUT_OF_RANGE;
             OS_Abort();
         }
     }
@@ -956,7 +838,7 @@ static void kernel_slow_clock(void)
  * Point of entry from the C runtime crt0.S.
  */
 void OS_Init()
-{   
+{
     int i;
 
     /* Set up the clocks */
@@ -967,6 +849,8 @@ void OS_Init()
     kernel_slow_clock();
 #endif
 
+    check_PPP_names();
+
     /*
      * Initialize dead pool to contain all but last task descriptor.
      *
@@ -975,16 +859,16 @@ void OS_Init()
     for (i = 0; i < MAXPROCESS - 1; i++)
     {
         task_desc[i].state = DEAD;
-/*        name_to_task_ptr[i] = NULL;*/
+        name_to_task_ptr[i] = NULL;
         task_desc[i].next = &task_desc[i + 1];
     }
     task_desc[MAXPROCESS - 1].next = NULL;
     dead_pool_queue.head = &task_desc[0];
     dead_pool_queue.tail = &task_desc[MAXPROCESS - 1];
 
-    /* Create idle "task" */
+	/* Create idle "task" */
     kernel_request_create_args.f = (voidfuncvoid_ptr)idle;
-    kernel_request_create_args.level = IDLE;
+    kernel_request_create_args.level = NULL;
     kernel_create_task();
 
     /* Create "main" task as SYSTEM level. */
@@ -996,6 +880,12 @@ void OS_Init()
     cur_task = task_desc;
     cur_task->state = RUNNING;
     dequeue(&system_queue);
+
+    /* Initilize time slot */
+    if(PT > 0)
+    {
+        ticks_remaining = PPP[1];
+    }
 
     /* Set up Timer 1 Output Compare interrupt,the TICK clock. */
     TIMSK1 |= _BV(OCIE1A);
@@ -1025,19 +915,17 @@ static void _delay_25ms(void)
 }
 
 
-/** 
- *@brief Abort the execution of this RTOS due to an unrecoverable erorr.
+/** @brief Abort the execution of this RTOS due to an unrecoverable erorr.
  */
 void OS_Abort(void)
 {
-
     uint8_t i, j;
     uint8_t flashes, mask;
 
     Disable_Interrupt();
 
     /* Initialize port for output */
-    DDRB = LED_RED_MASK | LED_GREEN_MASK;
+    DDRD = LED_RED_MASK | LED_GREEN_MASK;
 
     if(error_msg < ERR_RUN_1_USER_CALLED_OS_ABORT)
     {
@@ -1053,14 +941,14 @@ void OS_Abort(void)
 
     for(;;)
     {
-        PORTB = (uint8_t)(LED_RED_MASK | LED_GREEN_MASK);
+        PORTD = (uint8_t)(LED_RED_MASK | LED_GREEN_MASK);
 
         for(i = 0; i < 100; ++i)
         {
                _delay_25ms();
         }
 
-        PORTB = (uint8_t) 0;
+        PORTD = (uint8_t) 0;
 
         for(i = 0; i < 40; ++i)
         {
@@ -1070,14 +958,14 @@ void OS_Abort(void)
 
         for(j = 0; j < flashes; ++j)
         {
-            PORTB = mask;
+            PORTD = mask;
 
             for(i = 0; i < 10; ++i)
             {
                 _delay_25ms();
             }
 
-            PORTB = (uint8_t) 0;
+            PORTD = (uint8_t) 0;
 
             for(i = 0; i < 10; ++i)
             {
@@ -1092,13 +980,25 @@ void OS_Abort(void)
     }
 }
 
+
 /**
- * @brief Creates a system task and returns 0 if all went well.
- * @param (*f) the task
- * @param arg (int16_t)
- * @return retval (int)
+ * @param f  a parameterless function to be created as a process instance
+ * @param arg an integer argument to be assigned to this process instanace
+ * @param level assigned scheduling level: SYSTEM, PERIODIC or RR
+ * @param name assigned PERIODIC process name
+ * @return 0 if not successful; otherwise non-zero.
+ * @sa Task_GetArg(), PPP[].
+ *
+ *  A new process  is created to execute the parameterless
+ *  function @a f with an initial parameter @a arg, which is retrieved
+ *  by a call to Task_GetArg().  If a new process cannot be
+ *  created, 0 is returned; otherwise, it returns non-zero.
+ *  The created process will belong to its scheduling @a level.
+ *  If the process is PERIODIC, then its @a name is a user-specified name
+ *  to be used in the PPP[] array. Otherwise, @a name is ignored.
+ * @sa @ref policy
  */
-int8_t Task_Create_System(void (*f)(void), int16_t arg) 
+int Task_Create(void (*f)(void), int arg, unsigned int level, unsigned int name)
 {
     int retval;
     uint8_t sreg;
@@ -1108,7 +1008,8 @@ int8_t Task_Create_System(void (*f)(void), int16_t arg)
 
     kernel_request_create_args.f = (voidfuncvoid_ptr)f;
     kernel_request_create_args.arg = arg;
-    kernel_request_create_args.level = (uint8_t)SYSTEM;
+    kernel_request_create_args.level = (uint8_t)level;
+    kernel_request_create_args.name = (uint8_t)name;
 
     kernel_request = TASK_CREATE;
     enter_kernel();
@@ -1119,69 +1020,10 @@ int8_t Task_Create_System(void (*f)(void), int16_t arg)
     return retval;
 }
 
-/**
- * @brief Creates a round robin task and returns 0 if all went well.
- * @param (*f) the task
- * @param arg (int16_t)
- * @return retval (int)
- */
-int8_t Task_Create_RR(void (*f)(void), int16_t arg)
-{
-    int retval;
-    uint8_t sreg;
-
-    sreg = SREG;
-    Disable_Interrupt();
-
-    kernel_request_create_args.f = (voidfuncvoid_ptr)f;
-    kernel_request_create_args.arg = arg;
-    kernel_request_create_args.level = (uint8_t)RR;
-
-    kernel_request = TASK_CREATE;
-    enter_kernel();
-
-    retval = kernel_request_retval;
-    SREG = sreg;
-
-    return retval;
-}
 
 /**
- * @brief Creates a periodic task and returns 0 if all went well.
- * @param (*f) the task
- * @param arg (uint16_t)
- * @param period (uint16_t) how often in runs based on ticks
- * @param wcet (uint16_t) worst case execution time
- * @param start (uint16_t) first time the task runs
- * @return retval (int)
- */
-int8_t Task_Create_Periodic(void(*f)(void), int16_t arg, uint16_t period, uint16_t wcet, uint16_t start)
-{
-    int retval;
-    uint8_t sreg;
-
-    sreg = SREG;
-    Disable_Interrupt();
-
-    kernel_request_create_args.f = (voidfuncvoid_ptr)f;
-    kernel_request_create_args.arg = arg;
-    kernel_request_create_args.level = (uint8_t)PERIODIC;
-    kernel_request_create_args.period = period;
-    kernel_request_create_args.start = start;
-    kernel_request_create_args.wcet = wcet;
-
-    kernel_request = TASK_CREATE;
-    enter_kernel();
-
-    retval = kernel_request_retval;
-    SREG = sreg;
-
-    return retval;
-}
-
-/**
- * @brief The calling task gives up its share of the processor voluntarily.
- */
+  * @brief The calling task gives up its share of the processor voluntarily.
+  */
 void Task_Next()
 {
     uint8_t volatile sreg;
@@ -1197,8 +1039,8 @@ void Task_Next()
 
 
 /**
- * @brief The calling task terminates itself.
- */
+  * @brief The calling task terminates itself.
+  */
 void Task_Terminate()
 {
     uint8_t sreg;
@@ -1213,8 +1055,7 @@ void Task_Terminate()
 }
 
 
-/**
- * @brief Retrieve the assigned parameter.
+/** @brief Retrieve the assigned parameter.
  */
 int Task_GetArg(void)
 {
@@ -1232,87 +1073,10 @@ int Task_GetArg(void)
 }
 
 /**
- * @brief Initializes the services
- * @return service_ptr (SERVICE)
- */
-SERVICE* Service_Init()
-{
-    SERVICE* service_ptr;
-    uint8_t sreg = SREG;
-
-    Disable_Interrupt();
-
-    kernel_request = SERVICE_INIT;
-    enter_kernel();
-
-    service_ptr = (SERVICE *)kernel_request_service_ptr;
-
-    SREG = sreg;
-    
-    return service_ptr;
-}
-
-/**
- * @brief Subscribes to a service
- * @param s (SERVICE)
- * @param v (int16_t)
- */
-void Service_Subscribe( SERVICE *s, int16_t *v )
-{
-    uint8_t sreg = SREG;
-    
-    Disable_Interrupt();
-
-    kernel_request = SERVICE_SUBSCRIBE;
-    kernel_request_service_ptr = s;
-    cur_task->service_data = v;
-    
-    enter_kernel();
-    
-    SREG = sreg;
-}
-
-/**
- * @brief Publishes to the service
- * @param s (SERVICE)
- * @param v (int16_t)
- */
-void Service_Publish( SERVICE *s, int16_t v )
-{
-    uint8_t sreg= SREG;
-    Disable_Interrupt();
-
-    kernel_request = SERVICE_PUBLISH;
-    kernel_request_service_ptr = s;
-    kernel_request_service_data = v;
-    enter_kernel();
-
-    SREG = sreg;
-}
-
-#define CYCLES_IN_MS (TICK_CYCLES/TICK)
-
-/**
- * @brief gets the current milliseconds since the system started 
- */
-uint16_t Now() {
-    return ms_counter + ((10000 - (OCR1A - TCNT1))/CYCLES_IN_MS);
-}
-
-/**
- * @brief enables or disables preemption in tasks
- * @param preemptable (bool)
- */
-void Set_Tasks_Preemptable(bool preemptable)
-{
-    tasks_preemptable = preemptable;
-}
-
-/**
  * Runtime entry point into the program; just start the RTOS.  The application layer must define r_main() for its entry point.
  */
 int main()
 {
-    OS_Init();
-    return 0;
+	OS_Init();
+	return 0;
 }
